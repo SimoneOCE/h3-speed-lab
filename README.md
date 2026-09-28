@@ -92,11 +92,23 @@ when you want to hand results back for analysis.
 
 `run_test.py` above is a manual pod-driven test tool. `serverless_handler.py`
 is the actual thing — a proper RunPod Serverless handler, same pattern as
-`minimax-h3-worker/handler.py` uses in production for koboldcpp: it starts
-the SGLang server once when the worker cold-starts, then calls
-`runpod.serverless.start()`, RunPod's own worker loop, which pulls jobs
-from the queue and calls `handler()` for each one. Not something you SSH
-into and drive by hand.
+`minimax-h3-worker/handler.py` uses in production for koboldcpp. Not
+something you SSH into and drive by hand.
+
+**Third architectural correction, and the important one**: `handler.py`'s
+`runpod.serverless.start({"handler": handler})` is its literal last line,
+called immediately with nothing blocking before it — `start_kobold_if_needed()`
+is never called at module level, only from inside `handler()`/`run_session()`
+once a real job has already been claimed. An earlier version of this file
+called `start_sglang()` (server start + the venv install below) at module
+import time, *before* `runpod.serverless.start()` — meaning RunPod couldn't
+mark the worker claimable until that whole multi-minute setup finished,
+and workers were getting killed/recycled before ever accepting a job (their
+own "not even claimed" symptom). Fixed to match `handler.py` exactly:
+`runpod.serverless.start()` runs immediately, and `start_sglang()` is
+called from inside `handler(job)` instead — the worker registers as ready
+instantly, and the heavy loading only happens once a job is already
+dispatched to it.
 
 **Setup**: this repo has a real `Dockerfile`, same style as
 `minimax-h3-worker/Dockerfile` — digest-pinned base image, deploy via

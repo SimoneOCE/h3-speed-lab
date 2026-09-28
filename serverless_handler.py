@@ -3,19 +3,27 @@
 RunPod Serverless handler for MiniMax H3 via SGLang.
 
 Real production-pattern handler, same shape as minimax-h3-worker/handler.py
-uses for koboldcpp: runpod.serverless.start() blocks forever, pulling jobs
-from RunPod's queue and calling handler() for each one. The SGLang server
-itself is started once per cold start (module import time, below).
+uses for koboldcpp: runpod.serverless.start() is called immediately, at
+the very bottom of this file, with NOTHING blocking before it - matching
+handler.py exactly, where runpod.serverless.start() is its literal last
+line and start_kobold_if_needed() is never called at module level, only
+from inside handler()/run_session() once a real job has already been
+claimed. RunPod marks a worker "ready" the moment the module finishes
+importing, not after a model finishes loading - so any heavy setup done
+at import time (an earlier version of this file did exactly that) risks
+the worker being killed/recycled before it's even had a chance to accept
+a job. start_sglang() is called from inside handler() below for this
+reason, not above runpod.serverless.start().
 
-Matches handler.py's actual architecture, not just its file layout: the
-Docker image stays lean (see Dockerfile) and the one genuinely heavy,
-rarely-changing thing - SGLang's diffusion extras (diffusers,
-nvidia-nccl-cu13, etc.) - gets installed ONCE onto the persistent network
-volume (/runpod-volume), the same way handler.py's ensure_koboldcpp_engine()
-downloads the engine binary onto the volume instead of baking it into the
-image. Any worker, on any physical host, that mounts this same volume
-skips straight past the install and starts fast - it's not a per-host
-Docker-layer-cache thing, it's shared network storage.
+Also matches handler.py's architecture in a second way: the Docker image
+stays lean (see Dockerfile) and the one genuinely heavy, rarely-changing
+thing - SGLang's diffusion extras (diffusers, nvidia-nccl-cu13, etc.) -
+gets installed ONCE onto the persistent network volume (/runpod-volume),
+the same way handler.py's ensure_koboldcpp_engine() downloads the engine
+binary onto the volume instead of baking it into the image. Any worker,
+on any physical host, that mounts this same volume skips straight past
+the install and starts fast - it's not a per-host Docker-layer-cache
+thing, it's shared network storage.
 
 Set as this endpoint's "Container start command": leave it EMPTY. The
 Dockerfile's own CMD runs this file directly.
@@ -176,11 +184,6 @@ def sample_gpu_stats(stop_event, samples, interval=1.0):
             pass
 
 
-# Runs once per cold start (when RunPod imports this module), not per job -
-# this is the Load Time we've been measuring throughout this investigation.
-COLD_START_LOAD_TIME = start_sglang()
-
-
 def _extract_video_b64(data):
     """Handles a few plausible response shapes: a direct URL (downloaded
     and base64-encoded here so the job result is fully self-contained), or
@@ -222,6 +225,16 @@ def _poll_job(job_id, timeout=1800):
 
 
 def handler(job):
+    # Called only once this job has already been claimed/dispatched to
+    # this worker - matches handler.py's own pattern exactly
+    # (start_kobold_if_needed() is called from inside run_session(), which
+    # handler() calls, never at module import time). runpod.serverless.start()
+    # below registers this worker as claimable immediately; loading the
+    # actual model only after a real job arrives is what keeps a slow first
+    # load from ever counting against whatever "is this worker even alive"
+    # window RunPod applies before a job is dispatched.
+    load_time = start_sglang()
+
     inp = job.get("input", {})
     prompt = inp.get("prompt", "")
 
@@ -274,7 +287,7 @@ def handler(job):
     total_seconds = round(time.time() - request_received_at, 2)
 
     result = {
-        "cold_start_load_time_seconds": COLD_START_LOAD_TIME,
+        "cold_start_load_time_seconds": load_time,
         "dispatch_lag_seconds": dispatch_lag_seconds,
         "total_generation_seconds": total_seconds,
         "gpu_util_samples": gpu_samples,
