@@ -15,7 +15,7 @@ the worker being killed/recycled before it's even had a chance to accept
 a job. start_sglang() is called from inside handler() below for this
 reason, not above runpod.serverless.start().
 
-Fourth revision, and a real architectural pivot: earlier versions of this
+Fifth revision, and a real architectural pivot: earlier versions of this
 file installed SGLang's diffusion extras at runtime onto the persistent
 volume, to avoid re-pulling SGLang's official 13.8GB lmsysorg/sglang:dev
 image on every cold start that landed on an uncached host. This version
@@ -120,7 +120,7 @@ def start_sglang():
     while time.time() - load_start < timeout:
         if _is_ready():
             elapsed = round(time.time() - load_start, 1)
-            print(f"sglang ready after {elapsed}s (Load Time, includes any one-time venv install)", flush=True)
+            print(f"sglang ready after {elapsed}s (Load Time)", flush=True)
             return elapsed
         time.sleep(2)
     raise RuntimeError(f"sglang server did not become ready within {timeout}s")

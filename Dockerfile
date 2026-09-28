@@ -30,10 +30,19 @@
 FROM nvidia/cuda:13.0.0-cudnn-devel-ubuntu24.04@sha256:c2621d98e7de80c2aec5eb8403b19c67454c8f5b0c929e8588fd3563c9b6558d AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-dev git ca-certificates \
+    python3 python3-pip python3-dev build-essential git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 https://github.com/sgl-project/sglang.git /sgl-workspace/sglang
+# Pinned to a specific commit (not `--depth 1` off main, which would make
+# every rebuild silently pick up whatever's newest) - same reproducibility
+# discipline as the digest-pinned base images above. Refresh deliberately
+# by checking https://github.com/sgl-project/sglang/commits/main for a
+# new SHA, not as a side effect of an unrelated rebuild.
+RUN git init /sgl-workspace/sglang \
+    && cd /sgl-workspace/sglang \
+    && git remote add origin https://github.com/sgl-project/sglang.git \
+    && git fetch --depth 1 origin 2e7e0802f4f3edc94702933675a71d6c7ef4f24f \
+    && git checkout FETCH_HEAD
 
 # --prefix collects everything (SGLang, its diffusion extras, PyTorch, and
 # the runpod SDK) into one clean directory tree the final stage can copy
@@ -49,7 +58,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /install /usr/local
-COPY --from=builder /sgl-workspace/sglang /sgl-workspace/sglang
+# Deliberately NOT copying /sgl-workspace/sglang's source tree here - the
+# pip install above is non-editable, so the actual importable code already
+# lives in /usr/local's site-packages. If something breaks at runtime with
+# a missing-file error pointing at a path under /sgl-workspace, that's the
+# signal this assumption was wrong and the source tree needs adding back.
 
 WORKDIR /workspace
 COPY serverless_handler.py .
