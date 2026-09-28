@@ -150,6 +150,23 @@ GitHub-repo source isn't necessarily an in-place edit in RunPod's UI —
 may need a fresh endpoint. Same network volume (for the model cache) and
 GPU/region settings carry over regardless of which endpoint you use.
 
+**Sixth revision**: found and fixed a real gap the earlier revisions
+missed — `--model-path MiniMaxAI/MiniMax-H3` is a bare HF repo id, and
+SGLang resolves it via `huggingface_hub.snapshot_download()` with no
+`cache_dir` override (confirmed by reading SGLang's own
+`model_loader/weight_utils.py` directly, not assumed). Without pointing
+`HF_HOME` somewhere persistent, that falls back to the *container's own*
+ephemeral cache — meaning every fresh cold start was plausibly
+re-downloading the full ~60-80GB model from HuggingFace before the server
+could even start, regardless of how small/fast the Docker image itself
+is. `serverless_handler.py` now sets `HF_HOME`/`HUGGINGFACE_HUB_CACHE` to
+`/runpod-volume/hf-cache` before launching `sglang serve` — same idea as
+`handler.py`'s `VOLUME_DIR`/`ensure_koboldcpp_engine()` pattern for
+koboldcpp's engine, except HF's own cache is content-hash-linked, so no
+hand-rolled "is it already downloaded" marker file is needed — the first
+worker on a given volume pays the download once, every worker after that
+(on that same volume) finds the weights already there.
+
 **Sending a job**: use the endpoint's own **Requests** tab in the RunPod
 dashboard (not SSH, not curl) and paste:
 ```json

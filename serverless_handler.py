@@ -26,6 +26,17 @@ needed at all, because the image itself is now small enough that a fresh
 host paying the pull cost is a much smaller problem than it was against
 the 13.8GB official image.
 
+Sixth revision: HF_HOME is now pointed at the persistent volume (see
+HF_CACHE_DIR below) so the ~60-80GB MiniMax-H3 weights are downloaded once
+per volume, not once per cold start. --model-path is a bare HF repo id,
+and SGLang resolves that through huggingface_hub.snapshot_download() with
+no cache_dir override (confirmed by reading SGLang's own
+model_loader/weight_utils.py) - so without this, it was falling back to
+the CONTAINER's own ephemeral cache, meaning every fresh container
+re-downloaded the whole model before the server could even start. This
+was very likely the dominant slow part of "SGLang cold start," not
+anything about SGLang's own inference speed.
+
 Set as this endpoint's "Container start command": leave it EMPTY. The
 Dockerfile's own CMD runs this file directly.
 
@@ -59,6 +70,26 @@ SGLANG_HOST = "127.0.0.1"
 SGLANG_PORT = 30010
 BASE_URL = f"http://{SGLANG_HOST}:{SGLANG_PORT}"
 MODEL_PATH = "MiniMaxAI/MiniMax-H3"
+
+# Same fix as handler.py's ensure_koboldcpp_engine()/VOLUME_DIR pattern,
+# for the one piece this file was still missing: the model weights
+# themselves. --model-path above is a bare HF repo id, and SGLang resolves
+# that via huggingface_hub.snapshot_download() with no cache_dir override
+# (confirmed by reading model_loader/weight_utils.py directly, not
+# assumed) - meaning it falls back to HF_HOME/HUGGINGFACE_HUB_CACHE, which
+# defaults to the CONTAINER's own ephemeral disk, not the persistent
+# volume. Every cold start on a fresh container was therefore very
+# plausibly re-downloading the full ~60-80GB model from HuggingFace before
+# ever starting the server - the single biggest slow part, and not
+# something SGLang-vs-koboldcpp speed has anything to do with. Pointing
+# HF_HOME at the volume fixes this the same way KOBOLD_DIR living on
+# VOLUME_DIR does for the engine: first cold start on a given volume pays
+# the download once, every worker after that (on that volume) finds the
+# weights already there - HF's own cache uses content-hash-linked local
+# files, so no marker file is needed to detect "already downloaded" the
+# way kobold's PyInstaller extraction required.
+VOLUME_DIR = "/runpod-volume"
+HF_CACHE_DIR = os.path.join(VOLUME_DIR, "hf-cache")
 
 
 def _find_cuda_home():
@@ -108,6 +139,10 @@ def start_sglang():
     ]
     env = os.environ.copy()
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    os.makedirs(HF_CACHE_DIR, exist_ok=True)
+    env["HF_HOME"] = HF_CACHE_DIR
+    env["HUGGINGFACE_HUB_CACHE"] = HF_CACHE_DIR
+    print(f"Set HF_HOME={HF_CACHE_DIR} (model weights cached on persistent volume)", flush=True)
     cuda_home = _find_cuda_home()
     if cuda_home:
         env["CUDA_HOME"] = cuda_home
