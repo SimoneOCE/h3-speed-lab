@@ -110,31 +110,40 @@ called from inside `handler(job)` instead — the worker registers as ready
 instantly, and the heavy loading only happens once a job is already
 dispatched to it.
 
-**Setup**: this repo has a real `Dockerfile`, same style as
-`minimax-h3-worker/Dockerfile` — digest-pinned base image, deploy via
-RunPod's **"Deploy from a GitHub repository"** option (not "Deploy from a
-Docker image"), pointed at this repo (`SimoneOCE/h3-speed-lab`). Leave
-**Container start command** empty — the Dockerfile's `CMD` handles it.
+**Setup**: this repo has a real `Dockerfile`, digest-pinned like
+`minimax-h3-worker/Dockerfile`, deploy via RunPod's **"Deploy from a
+GitHub repository"** option, pointed at this repo. Leave **Container
+start command** empty — the Dockerfile's `CMD` handles it.
 
-**Important architectural note** — this took two attempts to get right,
-worth understanding why: the *image itself* stays deliberately lean
-(just `runpod`/`requests`, matching koboldcpp's own lean image). SGLang's
-diffusion extras — a genuinely heavy dependency tree — are **not** baked
-into the Dockerfile. First attempt did that, and it meant every worker
-landing on a physical host that hadn't already cached this specific image
-had to re-pull the whole bloated thing (confirmed via RunPod's own docs:
-they explicitly recommend model/dependency caching over baking large
-things into images, since Docker layer caching is per-host, not
-fleet-wide).
+**Fifth architectural revision, the biggest one**: this is no longer
+built on `lmsysorg/sglang:dev` at all. Real, registry-confirmed numbers
+that drove this: `lmsysorg/sglang:dev` is **13.80GB** compressed,
+their own `latest-cu130-runtime` tag only gets to **12.64GB** (8%
+smaller) — vs. koboldcpp's own base image at **0.28GB**. That's
+structural, not something a runtime-venv-on-the-volume workaround (the
+previous version of this file) fixes — it only avoided re-installing
+dependencies per cold start, not the base image pull itself on a host
+that's never cached it.
 
-Instead, `serverless_handler.py`'s `ensure_sglang_diffusion_installed()`
-installs the diffusion extras once into a venv on the **persistent
-network volume** (`/runpod-volume`), with a marker file so every future
-worker — on any physical host, since it's shared network storage, not a
-per-host Docker cache — skips straight past it. This is the direct
-equivalent of `handler.py`'s `ensure_koboldcpp_engine()`, which downloads
-the koboldcpp engine binary onto the volume instead of baking it into
-its image, for the exact same reason.
+So this `Dockerfile` is now a genuinely custom, multi-stage build:
+a `nvidia/cuda:*-cudnn-devel-*` builder stage (has the compiler, only to
+build SGLang's extensions — never shipped) installs SGLang + diffusion
+extras + the `runpod` SDK via `pip install --prefix=/install`, then a
+`nvidia/cuda:*-cudnn-runtime-*` final stage (no compiler, no devel
+headers) copies over just that installed tree. `serverless_handler.py`
+no longer does any runtime install at all — no venv, no cross-worker
+lock, no persistent-volume dependency for anything except the model
+weights themselves.
+
+This was blocked on a real, verified risk before starting: `sgl_kernel`
+had a regression (`sgl-project/sglang#11333`) that hard-crashed on
+import if the CUDA **devel** toolkit wasn't present — which would have
+broken this exact "runtime-only final stage" approach. Confirmed fixed
+in `sgl-project/sglang#13089`, merged into `main` 2025-12-02 (the check
+is now a graceful fallback, not a crash). `serverless_handler.py` also
+sets `CUDA_HOME` to the pip-installed `nvidia-cuda-runtime` package's own
+directory at process start — the community-confirmed workaround from
+that same issue thread — belt-and-suspenders even with the fix merged.
 
 Note: switching an existing endpoint from a Docker-image source to a
 GitHub-repo source isn't necessarily an in-place edit in RunPod's UI —

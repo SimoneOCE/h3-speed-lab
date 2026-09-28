@@ -15,15 +15,16 @@ the worker being killed/recycled before it's even had a chance to accept
 a job. start_sglang() is called from inside handler() below for this
 reason, not above runpod.serverless.start().
 
-Also matches handler.py's architecture in a second way: the Docker image
-stays lean (see Dockerfile) and the one genuinely heavy, rarely-changing
-thing - SGLang's diffusion extras (diffusers, nvidia-nccl-cu13, etc.) -
-gets installed ONCE onto the persistent network volume (/runpod-volume),
-the same way handler.py's ensure_koboldcpp_engine() downloads the engine
-binary onto the volume instead of baking it into the image. Any worker,
-on any physical host, that mounts this same volume skips straight past
-the install and starts fast - it's not a per-host Docker-layer-cache
-thing, it's shared network storage.
+Fourth revision, and a real architectural pivot: earlier versions of this
+file installed SGLang's diffusion extras at runtime onto the persistent
+volume, to avoid re-pulling SGLang's official 13.8GB lmsysorg/sglang:dev
+image on every cold start that landed on an uncached host. This version
+instead uses a genuinely custom, minimal Dockerfile (see Dockerfile in
+this repo) that installs SGLang + diffusion extras at BUILD time into a
+purpose-built image - no runtime install, no venv, no cross-worker lock
+needed at all, because the image itself is now small enough that a fresh
+host paying the pull cost is a much smaller problem than it was against
+the 13.8GB official image.
 
 Set as this endpoint's "Container start command": leave it EMPTY. The
 Dockerfile's own CMD runs this file directly.
@@ -59,87 +60,19 @@ SGLANG_PORT = 30010
 BASE_URL = f"http://{SGLANG_HOST}:{SGLANG_PORT}"
 MODEL_PATH = "MiniMaxAI/MiniMax-H3"
 
-VOLUME_DIR = "/runpod-volume"
-VENV_DIR = os.path.join(VOLUME_DIR, "sglang-diffusion-venv")
-VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python")
-VENV_SGLANG = os.path.join(VENV_DIR, "bin", "sglang")
-INSTALL_MARKER = os.path.join(VENV_DIR, ".install_complete")
-INSTALL_LOCK_DIR = os.path.join(VOLUME_DIR, ".sglang_venv_install.lock")
 
-
-STALE_LOCK_SECONDS = 1200  # 20 min - generous vs. the few minutes a real install has taken
-
-
-def ensure_sglang_diffusion_installed():
-    """One-time (per volume, not per worker) install of SGLang's diffusion
-    extras into a venv on the persistent volume - the direct equivalent of
-    handler.py's ensure_koboldcpp_engine(): a no-op if it's already there,
-    downloaded/installed once and shared by every future worker that
-    mounts this volume, not baked into the Docker image."""
-    if os.path.exists(INSTALL_MARKER):
-        print("sglang diffusion venv already present on volume - skipping install.", flush=True)
-        return
-
-    # Cross-worker lock: mkdir is atomic, so this is safe against two cold
-    # starts racing to build the venv at once. Recovers from a STALE lock
-    # too - if a worker holding it gets hard-killed (e.g. RunPod recycling
-    # it mid-install), Python's `finally` cleanup never runs, and a dead
-    # lock would otherwise block every future worker on this volume
-    # forever. A lock older than STALE_LOCK_SECONDS with no completed
-    # install is assumed dead and cleared.
-    while True:
-        try:
-            os.makedirs(INSTALL_LOCK_DIR)
-            break  # got the lock
-        except FileExistsError:
-            pass
-
-        try:
-            lock_age = time.time() - os.stat(INSTALL_LOCK_DIR).st_mtime
-        except FileNotFoundError:
-            continue  # lock vanished between our failed mkdir and this stat - just retry
-
-        if lock_age > STALE_LOCK_SECONDS:
-            print(
-                f"Lock is {round(lock_age)}s old (> {STALE_LOCK_SECONDS}s) with no completed "
-                f"install - treating it as stale (an earlier worker was likely killed "
-                f"mid-install) and clearing it.",
-                flush=True,
-            )
-            try:
-                os.rmdir(INSTALL_LOCK_DIR)
-            except OSError:
-                pass
-            continue  # retry acquiring
-
-        if os.path.exists(INSTALL_MARKER):
-            print("Install finished by the other worker.", flush=True)
-            return
-        print(f"Another worker is installing the sglang venv (lock age {round(lock_age)}s) - waiting...", flush=True)
-        time.sleep(5)
-
+def _find_cuda_home():
+    """The community-confirmed workaround for sgl-project/sglang#11333
+    (see Dockerfile's own comment for the full story): point CUDA_HOME at
+    the pip-installed nvidia-cuda-runtime package's own directory rather
+    than relying on a system CUDA install. Belt-and-suspenders even with
+    the upstream fix (PR #13089) merged - costs nothing if unneeded.
+    Never raises: worst case sglang falls back to its own detection."""
     try:
-        print("Building sglang diffusion venv on persistent volume (one-time, first worker only)...", flush=True)
-        os.makedirs(VENV_DIR, exist_ok=True)
-        # --system-site-packages: inherit the base image's already-installed
-        # torch/CUDA stack instead of redownloading it - only the diffusion
-        # extras' own additional dependencies actually need installing.
-        subprocess.run(
-            [sys.executable, "-m", "venv", "--system-site-packages", VENV_DIR],
-            check=True,
-        )
-        subprocess.run(
-            [VENV_PYTHON, "-m", "pip", "install", "-e", "/sgl-workspace/sglang/python[diffusion]"],
-            check=True,
-        )
-        with open(INSTALL_MARKER, "w") as f:
-            f.write(str(time.time()))
-        print("sglang diffusion venv install complete.", flush=True)
-    finally:
-        try:
-            os.rmdir(INSTALL_LOCK_DIR)
-        except OSError:
-            pass
+        import nvidia.cuda_runtime
+        return os.path.dirname(nvidia.cuda_runtime.__file__)
+    except Exception:
+        return None
 
 
 def _is_ready():
@@ -159,12 +92,11 @@ def start_sglang():
         return None
 
     load_start = time.time()
-    ensure_sglang_diffusion_installed()
 
     # Same flags as run_test.py - RTX 5090 tier from SGLang's own
     # MiniMax-H3 cookbook (lmsysorg.mintlify.app/cookbook/diffusion/MiniMax/MiniMax-H3).
     cmd = [
-        VENV_SGLANG, "serve",
+        "sglang", "serve",
         "--model-path", MODEL_PATH,
         "--model-variant", "fl2va",
         "--performance-mode", "memory",
@@ -176,6 +108,11 @@ def start_sglang():
     ]
     env = os.environ.copy()
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    cuda_home = _find_cuda_home()
+    if cuda_home:
+        env["CUDA_HOME"] = cuda_home
+        env["CUDA_PATH"] = cuda_home
+        print(f"Set CUDA_HOME={cuda_home}", flush=True)
     print("Starting sglang server...", flush=True)
     subprocess.Popen(cmd, env=env, stdout=sys.stdout, stderr=sys.stdout)
 
