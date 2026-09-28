@@ -44,6 +44,22 @@ RUN git init /sgl-workspace/sglang \
     && git fetch --depth 1 origin 2e7e0802f4f3edc94702933675a71d6c7ef4f24f \
     && git checkout FETCH_HEAD
 
+# SGLang's pip build tries to discover and compile Rust extensions from
+# /sgl-workspace/sglang/rust (crates: sglang-grpc, sglang-mm,
+# sglang-radix-tree, sglang-renderer, sglang-server) - this needs a cargo
+# toolchain, which this image intentionally doesn't have. Checked what's
+# actually in there before disabling it, not just guessing: those crates
+# are disaggregated prefill/decode routing and gRPC serving infra for LLM
+# TEXT serving - the CLI entry point (sglang.cli.main:main) and the
+# default HTTP server (sglang.srt.entrypoints.http_server) are pure
+# Python, and the gRPC modules are only conditionally imported, never by
+# the plain `sglang serve` diffusion path this handler uses. The actual
+# diffusion-relevant native deps - st_attn/vsa (spatiotemporal/video
+# sparse attention) - are separate pip packages built through their own
+# torch-based setuptools path, unrelated to this Cargo workspace. Safe to
+# skip per the error message's own documented escape hatch.
+ENV SGLANG_BUILD_RUST_EXTS=none
+
 # --prefix collects everything (SGLang, its diffusion extras, PyTorch, and
 # the runpod SDK) into one clean directory tree the final stage can copy
 # wholesale, instead of guessing which files matter across a full OS install.
