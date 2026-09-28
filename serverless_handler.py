@@ -2,16 +2,23 @@
 """
 RunPod Serverless handler for MiniMax H3 via SGLang.
 
-This is the real handler RunPod's worker SDK invokes per job - not a
-manual test script like run_test.py. Mirrors the exact pattern
-minimax-h3-worker/handler.py already uses in production for koboldcpp:
-start the model server once when the worker cold-starts (module import
-time, below), then process each job by calling its HTTP API and
-returning the result. runpod.serverless.start() blocks forever, pulling
-jobs from RunPod's queue and calling handler() for each one.
+Real production-pattern handler, same shape as minimax-h3-worker/handler.py
+uses for koboldcpp: runpod.serverless.start() blocks forever, pulling jobs
+from RunPod's queue and calling handler() for each one. The SGLang server
+itself is started once per cold start (module import time, below).
 
-Set as this endpoint's "Container start command":
-    bash -c "python -m pip install -e '/sgl-workspace/sglang/python[diffusion]' && pip install runpod requests && git clone https://github.com/SimoneOCE/h3-speed-lab.git /tmp/h3-speed-lab && python /tmp/h3-speed-lab/serverless_handler.py"
+Matches handler.py's actual architecture, not just its file layout: the
+Docker image stays lean (see Dockerfile) and the one genuinely heavy,
+rarely-changing thing - SGLang's diffusion extras (diffusers,
+nvidia-nccl-cu13, etc.) - gets installed ONCE onto the persistent network
+volume (/runpod-volume), the same way handler.py's ensure_koboldcpp_engine()
+downloads the engine binary onto the volume instead of baking it into the
+image. Any worker, on any physical host, that mounts this same volume
+skips straight past the install and starts fast - it's not a per-host
+Docker-layer-cache thing, it's shared network storage.
+
+Set as this endpoint's "Container start command": leave it EMPTY. The
+Dockerfile's own CMD runs this file directly.
 
 Job input (all optional, defaults match the production koboldcpp
 baseline used throughout this investigation - 1280x736/175 frames/20 steps):
@@ -24,16 +31,10 @@ baseline used throughout this investigation - 1280x736/175 frames/20 steps):
         "seed": 1101
     }}
 
-Response includes real timing (Dispatch Lag = request received -> first
-GPU activity, Generation Duration = total time), GPU-util samples (same
-[unix_ts, gpu_util_pct, vram_used_mb] shape as handler.py's own
-sample_gpu_stats), and the video itself as base64 if SGLang's response
-shape allows extracting it.
-
 KNOWN GAP, same one flagged in run_test.py: SGLang's own docs don't
 confirm the /v1/videos response shape (sync video vs. an async job id to
 poll). If extraction fails, the raw response is returned instead so we
-can see it and adjust _extract_video/_poll_job to match reality.
+can see it and adjust _extract_video_b64/_poll_job to match reality.
 """
 import base64
 import os
@@ -49,6 +50,67 @@ SGLANG_HOST = "127.0.0.1"
 SGLANG_PORT = 30010
 BASE_URL = f"http://{SGLANG_HOST}:{SGLANG_PORT}"
 MODEL_PATH = "MiniMaxAI/MiniMax-H3"
+
+VOLUME_DIR = "/runpod-volume"
+VENV_DIR = os.path.join(VOLUME_DIR, "sglang-diffusion-venv")
+VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python")
+VENV_SGLANG = os.path.join(VENV_DIR, "bin", "sglang")
+INSTALL_MARKER = os.path.join(VENV_DIR, ".install_complete")
+INSTALL_LOCK_DIR = os.path.join(VOLUME_DIR, ".sglang_venv_install.lock")
+
+
+def ensure_sglang_diffusion_installed():
+    """One-time (per volume, not per worker) install of SGLang's diffusion
+    extras into a venv on the persistent volume - the direct equivalent of
+    handler.py's ensure_koboldcpp_engine(): a no-op if it's already there,
+    downloaded/installed once and shared by every future worker that
+    mounts this volume, not baked into the Docker image."""
+    if os.path.exists(INSTALL_MARKER):
+        print("sglang diffusion venv already present on volume - skipping install.", flush=True)
+        return
+
+    # Simple cross-worker lock: mkdir is atomic, so this is safe against two
+    # cold starts racing to build the venv at the same time. If another
+    # worker is mid-install, wait for it rather than corrupt a shared venv.
+    got_lock = False
+    try:
+        os.makedirs(INSTALL_LOCK_DIR)
+        got_lock = True
+    except FileExistsError:
+        pass
+
+    if not got_lock:
+        print("Another worker is already installing the sglang venv - waiting...", flush=True)
+        wait_start = time.time()
+        while time.time() - wait_start < 1800:
+            if os.path.exists(INSTALL_MARKER):
+                print("Install finished by the other worker.", flush=True)
+                return
+            time.sleep(5)
+        raise RuntimeError("Timed out waiting for another worker's sglang venv install.")
+
+    try:
+        print("Building sglang diffusion venv on persistent volume (one-time, first worker only)...", flush=True)
+        os.makedirs(VENV_DIR, exist_ok=True)
+        # --system-site-packages: inherit the base image's already-installed
+        # torch/CUDA stack instead of redownloading it - only the diffusion
+        # extras' own additional dependencies actually need installing.
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--system-site-packages", VENV_DIR],
+            check=True,
+        )
+        subprocess.run(
+            [VENV_PYTHON, "-m", "pip", "install", "-e", "/sgl-workspace/sglang/python[diffusion]"],
+            check=True,
+        )
+        with open(INSTALL_MARKER, "w") as f:
+            f.write(str(time.time()))
+        print("sglang diffusion venv install complete.", flush=True)
+    finally:
+        try:
+            os.rmdir(INSTALL_LOCK_DIR)
+        except OSError:
+            pass
 
 
 def _is_ready():
@@ -67,10 +129,13 @@ def start_sglang():
         print("sglang already running.", flush=True)
         return None
 
+    load_start = time.time()
+    ensure_sglang_diffusion_installed()
+
     # Same flags as run_test.py - RTX 5090 tier from SGLang's own
     # MiniMax-H3 cookbook (lmsysorg.mintlify.app/cookbook/diffusion/MiniMax/MiniMax-H3).
     cmd = [
-        "sglang", "serve",
+        VENV_SGLANG, "serve",
         "--model-path", MODEL_PATH,
         "--model-variant", "fl2va",
         "--performance-mode", "memory",
@@ -82,15 +147,14 @@ def start_sglang():
     ]
     env = os.environ.copy()
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    print("Starting sglang server (cold start)...", flush=True)
+    print("Starting sglang server...", flush=True)
     subprocess.Popen(cmd, env=env, stdout=sys.stdout, stderr=sys.stdout)
 
-    start = time.time()
     timeout = 1800
-    while time.time() - start < timeout:
+    while time.time() - load_start < timeout:
         if _is_ready():
-            elapsed = round(time.time() - start, 1)
-            print(f"sglang ready after {elapsed}s (Load Time)", flush=True)
+            elapsed = round(time.time() - load_start, 1)
+            print(f"sglang ready after {elapsed}s (Load Time, includes any one-time venv install)", flush=True)
             return elapsed
         time.sleep(2)
     raise RuntimeError(f"sglang server did not become ready within {timeout}s")

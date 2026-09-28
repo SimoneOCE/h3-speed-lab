@@ -98,17 +98,31 @@ the SGLang server once when the worker cold-starts, then calls
 from the queue and calls `handler()` for each one. Not something you SSH
 into and drive by hand.
 
-**Setup**: this repo now has a real `Dockerfile`, same style as
-`minimax-h3-worker/Dockerfile` — digest-pinned base image, everything
-(SGLang's diffusion extras, the `runpod` SDK, the handler itself) installed
-at **build time**, not re-installed on every cold start via a
-`git clone`-in-start-command hack. Deploy it with RunPod's
-**"Deploy from a GitHub repository"** option (not "Deploy from a Docker
-image" — that's the old path), pointed at this repo
-(`SimoneOCE/h3-speed-lab`). RunPod builds the image from the Dockerfile
-itself; no separate CI/CD config needed, same as production. Leave the
-**Container start command** field empty — the Dockerfile's own `CMD`
-handles that now.
+**Setup**: this repo has a real `Dockerfile`, same style as
+`minimax-h3-worker/Dockerfile` — digest-pinned base image, deploy via
+RunPod's **"Deploy from a GitHub repository"** option (not "Deploy from a
+Docker image"), pointed at this repo (`SimoneOCE/h3-speed-lab`). Leave
+**Container start command** empty — the Dockerfile's `CMD` handles it.
+
+**Important architectural note** — this took two attempts to get right,
+worth understanding why: the *image itself* stays deliberately lean
+(just `runpod`/`requests`, matching koboldcpp's own lean image). SGLang's
+diffusion extras — a genuinely heavy dependency tree — are **not** baked
+into the Dockerfile. First attempt did that, and it meant every worker
+landing on a physical host that hadn't already cached this specific image
+had to re-pull the whole bloated thing (confirmed via RunPod's own docs:
+they explicitly recommend model/dependency caching over baking large
+things into images, since Docker layer caching is per-host, not
+fleet-wide).
+
+Instead, `serverless_handler.py`'s `ensure_sglang_diffusion_installed()`
+installs the diffusion extras once into a venv on the **persistent
+network volume** (`/runpod-volume`), with a marker file so every future
+worker — on any physical host, since it's shared network storage, not a
+per-host Docker cache — skips straight past it. This is the direct
+equivalent of `handler.py`'s `ensure_koboldcpp_engine()`, which downloads
+the koboldcpp engine binary onto the volume instead of baking it into
+its image, for the exact same reason.
 
 Note: switching an existing endpoint from a Docker-image source to a
 GitHub-repo source isn't necessarily an in-place edit in RunPod's UI —
