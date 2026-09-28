@@ -98,15 +98,22 @@ the SGLang server once when the worker cold-starts, then calls
 from the queue and calls `handler()` for each one. Not something you SSH
 into and drive by hand.
 
-**Setup**: on your Serverless endpoint's Docker configuration, set the
-**Container start command** to:
-```
-bash -c "python -m pip install -e '/sgl-workspace/sglang/python[diffusion]' && pip install runpod requests && git clone https://github.com/SimoneOCE/h3-speed-lab.git /tmp/h3-speed-lab && python /tmp/h3-speed-lab/serverless_handler.py"
-```
-Do **not** override the start command with anything like `sleep infinity`
-on a Serverless endpoint — unlike Pods, that breaks RunPod's own SSH/worker
-provisioning, which depends on the real `runpod.serverless.start()` process
-actually running (confirmed via RunPod's own debugging docs).
+**Setup**: this repo now has a real `Dockerfile`, same style as
+`minimax-h3-worker/Dockerfile` — digest-pinned base image, everything
+(SGLang's diffusion extras, the `runpod` SDK, the handler itself) installed
+at **build time**, not re-installed on every cold start via a
+`git clone`-in-start-command hack. Deploy it with RunPod's
+**"Deploy from a GitHub repository"** option (not "Deploy from a Docker
+image" — that's the old path), pointed at this repo
+(`SimoneOCE/h3-speed-lab`). RunPod builds the image from the Dockerfile
+itself; no separate CI/CD config needed, same as production. Leave the
+**Container start command** field empty — the Dockerfile's own `CMD`
+handles that now.
+
+Note: switching an existing endpoint from a Docker-image source to a
+GitHub-repo source isn't necessarily an in-place edit in RunPod's UI —
+may need a fresh endpoint. Same network volume (for the model cache) and
+GPU/region settings carry over regardless of which endpoint you use.
 
 **Sending a job**: use the endpoint's own **Requests** tab in the RunPod
 dashboard (not SSH, not curl) and paste:
