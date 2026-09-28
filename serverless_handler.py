@@ -90,6 +90,26 @@ MODEL_PATH = "MiniMaxAI/MiniMax-H3"
 # way kobold's PyInstaller extraction required.
 VOLUME_DIR = "/runpod-volume"
 HF_CACHE_DIR = os.path.join(VOLUME_DIR, "hf-cache")
+# Where HF's own hub cache lands a fully-downloaded MiniMax-H3 snapshot -
+# used only to tell "this is a genuine first-ever download" apart from
+# "the weights are already on the volume" BEFORE starting sglang, so the
+# right timeout budget (below) gets picked. Not used to skip anything
+# ourselves - HF's own cache already does that internally.
+_MODEL_CACHE_MARKER = os.path.join(HF_CACHE_DIR, "hub", "models--" + MODEL_PATH.replace("/", "--"))
+
+# handler.py's own COLD_START_MAX_WAIT_SECONDS/WARM_RESTART_MAX_WAIT_SECONDS
+# split exists because of a real incident: a network-volume read once
+# measured as slow as 19MB/s, blowing straight through a 180s timeout on a
+# file that was already on disk and not actually broken - "already
+# downloaded" turned out not to mean "loads quickly." MiniMax-H3's weights
+# are roughly 60-80GB; at that same bad-case throughput a genuine first
+# download alone could take over an hour, which a single flat 1800s
+# timeout wouldn't survive even on a perfectly healthy worker. Splitting
+# these the same way, with generous headroom on both - these numbers are
+# provisional (no real run has confirmed our own network-volume throughput
+# yet), worth tightening once we have an actual timing number back.
+COLD_START_MAX_WAIT_SECONDS = 3600
+WARM_RESTART_MAX_WAIT_SECONDS = 1200
 
 
 def _find_cuda_home():
@@ -122,6 +142,20 @@ def start_sglang():
         print("sglang already running.", flush=True)
         return None
 
+    # Checked BEFORE start, same as handler.py's own start_kobold_if_needed -
+    # reflects whether a real download is actually about to happen, not
+    # whether one technically could (HF's cache dir already exists once
+    # created below regardless).
+    needs_download = not os.path.isdir(_MODEL_CACHE_MARKER)
+    max_wait = COLD_START_MAX_WAIT_SECONDS if needs_download else WARM_RESTART_MAX_WAIT_SECONDS
+    print(
+        f"Model cache {'not found' if needs_download else 'found'} at "
+        f"{_MODEL_CACHE_MARKER} - treating this as a "
+        f"{'cold download' if needs_download else 'warm restart'}, "
+        f"max wait {max_wait}s.",
+        flush=True,
+    )
+
     load_start = time.time()
 
     # Same flags as run_test.py - RTX 5090 tier from SGLang's own
@@ -151,14 +185,13 @@ def start_sglang():
     print("Starting sglang server...", flush=True)
     subprocess.Popen(cmd, env=env, stdout=sys.stdout, stderr=sys.stdout)
 
-    timeout = 1800
-    while time.time() - load_start < timeout:
+    while time.time() - load_start < max_wait:
         if _is_ready():
             elapsed = round(time.time() - load_start, 1)
             print(f"sglang ready after {elapsed}s (Load Time)", flush=True)
             return elapsed
         time.sleep(2)
-    raise RuntimeError(f"sglang server did not become ready within {timeout}s")
+    raise RuntimeError(f"sglang server did not become ready within {max_wait}s")
 
 
 def sample_gpu_stats(stop_event, samples, interval=1.0):
