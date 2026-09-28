@@ -67,6 +67,9 @@ INSTALL_MARKER = os.path.join(VENV_DIR, ".install_complete")
 INSTALL_LOCK_DIR = os.path.join(VOLUME_DIR, ".sglang_venv_install.lock")
 
 
+STALE_LOCK_SECONDS = 1200  # 20 min - generous vs. the few minutes a real install has taken
+
+
 def ensure_sglang_diffusion_installed():
     """One-time (per volume, not per worker) install of SGLang's diffusion
     extras into a venv on the persistent volume - the direct equivalent of
@@ -77,25 +80,43 @@ def ensure_sglang_diffusion_installed():
         print("sglang diffusion venv already present on volume - skipping install.", flush=True)
         return
 
-    # Simple cross-worker lock: mkdir is atomic, so this is safe against two
-    # cold starts racing to build the venv at the same time. If another
-    # worker is mid-install, wait for it rather than corrupt a shared venv.
-    got_lock = False
-    try:
-        os.makedirs(INSTALL_LOCK_DIR)
-        got_lock = True
-    except FileExistsError:
-        pass
+    # Cross-worker lock: mkdir is atomic, so this is safe against two cold
+    # starts racing to build the venv at once. Recovers from a STALE lock
+    # too - if a worker holding it gets hard-killed (e.g. RunPod recycling
+    # it mid-install), Python's `finally` cleanup never runs, and a dead
+    # lock would otherwise block every future worker on this volume
+    # forever. A lock older than STALE_LOCK_SECONDS with no completed
+    # install is assumed dead and cleared.
+    while True:
+        try:
+            os.makedirs(INSTALL_LOCK_DIR)
+            break  # got the lock
+        except FileExistsError:
+            pass
 
-    if not got_lock:
-        print("Another worker is already installing the sglang venv - waiting...", flush=True)
-        wait_start = time.time()
-        while time.time() - wait_start < 1800:
-            if os.path.exists(INSTALL_MARKER):
-                print("Install finished by the other worker.", flush=True)
-                return
-            time.sleep(5)
-        raise RuntimeError("Timed out waiting for another worker's sglang venv install.")
+        try:
+            lock_age = time.time() - os.stat(INSTALL_LOCK_DIR).st_mtime
+        except FileNotFoundError:
+            continue  # lock vanished between our failed mkdir and this stat - just retry
+
+        if lock_age > STALE_LOCK_SECONDS:
+            print(
+                f"Lock is {round(lock_age)}s old (> {STALE_LOCK_SECONDS}s) with no completed "
+                f"install - treating it as stale (an earlier worker was likely killed "
+                f"mid-install) and clearing it.",
+                flush=True,
+            )
+            try:
+                os.rmdir(INSTALL_LOCK_DIR)
+            except OSError:
+                pass
+            continue  # retry acquiring
+
+        if os.path.exists(INSTALL_MARKER):
+            print("Install finished by the other worker.", flush=True)
+            return
+        print(f"Another worker is installing the sglang venv (lock age {round(lock_age)}s) - waiting...", flush=True)
+        time.sleep(5)
 
     try:
         print("Building sglang diffusion venv on persistent volume (one-time, first worker only)...", flush=True)
