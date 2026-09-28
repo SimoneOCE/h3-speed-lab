@@ -88,6 +88,53 @@ per-session data, not code) and saves the resulting `.mp4` to `outputs/`
 however you'd normally grab files (the pod's file browser, `scp`, etc.)
 when you want to hand results back for analysis.
 
+## Real Serverless deployment (`serverless_handler.py`)
+
+`run_test.py` above is a manual pod-driven test tool. `serverless_handler.py`
+is the actual thing — a proper RunPod Serverless handler, same pattern as
+`minimax-h3-worker/handler.py` uses in production for koboldcpp: it starts
+the SGLang server once when the worker cold-starts, then calls
+`runpod.serverless.start()`, RunPod's own worker loop, which pulls jobs
+from the queue and calls `handler()` for each one. Not something you SSH
+into and drive by hand.
+
+**Setup**: on your Serverless endpoint's Docker configuration, set the
+**Container start command** to:
+```
+bash -c "python -m pip install -e '/sgl-workspace/sglang/python[diffusion]' && pip install runpod requests && git clone https://github.com/SimoneOCE/h3-speed-lab.git /tmp/h3-speed-lab && python /tmp/h3-speed-lab/serverless_handler.py"
+```
+Do **not** override the start command with anything like `sleep infinity`
+on a Serverless endpoint — unlike Pods, that breaks RunPod's own SSH/worker
+provisioning, which depends on the real `runpod.serverless.start()` process
+actually running (confirmed via RunPod's own debugging docs).
+
+**Sending a job**: use the endpoint's own **Requests** tab in the RunPod
+dashboard (not SSH, not curl) and paste:
+```json
+{"input": {"prompt": "your prompt here"}}
+```
+All fields are optional and default to the production baseline settings
+(`duration_seconds: 7.29`, `short_edge: 736`, `aspect_ratio: "16:9"`,
+`num_inference_steps: 20`) for direct comparability with the koboldcpp and
+ComfyUI numbers.
+
+**Response** is self-contained — no need to tail logs separately:
+- `cold_start_load_time_seconds` — Load Time, only present on the job that
+  triggered the cold start (SGLang server startup).
+- `dispatch_lag_seconds` — time from request dispatched to SGLang's
+  `/v1/videos` responding.
+- `total_generation_seconds` — total handler time for this job.
+- `gpu_util_samples` — same `[unix_ts, gpu_util_pct, vram_used_mb]` shape
+  as `handler.py`'s own `sample_gpu_stats`.
+- `video_base64` — the generated video, base64-encoded, if SGLang's
+  response shape allowed extracting it. To save it as a real `.mp4`:
+  ```bash
+  python3 -c "import base64,sys; open('out.mp4','wb').write(base64.b64decode(sys.stdin.read()))" <<< "PASTE_THE_BASE64_HERE"
+  ```
+- If extraction failed, you'll get `raw_response` + `note` instead —
+  paste that back so `_extract_video_b64`/`_poll_job` can be fixed against
+  the real response shape.
+
 ## Known gap — read before the first real run
 
 SGLang's own MiniMax-H3 cookbook documents the server launch flags and
