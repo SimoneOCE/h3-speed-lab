@@ -80,6 +80,19 @@ COPY --from=builder /install /usr/local
 # a missing-file error pointing at a path under /sgl-workspace, that's the
 # signal this assumption was wrong and the source tree needs adding back.
 
+# Without this, `import requests` (and everything else pip installed above)
+# fails with ModuleNotFoundError despite the files genuinely being present
+# on disk after the COPY - confirmed by a real build+run cycle, not a
+# hypothetical. Ubuntu/Debian patches python3's site.py to only scan
+# /usr/local/lib/python3.X/dist-packages by default; `pip install
+# --prefix=...` bypasses that Debian-specific layout and uses the standard
+# site-packages path instead, since --prefix forces the vanilla install
+# scheme. The two stages' apt-get installs happen seconds apart against
+# the same live Ubuntu 24.04 mirror, so both get the exact same python3.12
+# - confirmed directly from the build log's own cp312 wheel filenames, not
+# assumed.
+ENV PYTHONPATH=/usr/local/lib/python3.12/site-packages
+
 WORKDIR /workspace
 COPY serverless_handler.py .
 
