@@ -115,35 +115,52 @@ dispatched to it.
 GitHub repository"** option, pointed at this repo. Leave **Container
 start command** empty — the Dockerfile's `CMD` handles it.
 
-**Fifth architectural revision, the biggest one**: this is no longer
-built on `lmsysorg/sglang:dev` at all. Real, registry-confirmed numbers
-that drove this: `lmsysorg/sglang:dev` is **13.80GB** compressed,
-their own `latest-cu130-runtime` tag only gets to **12.64GB** (8%
-smaller) — vs. koboldcpp's own base image at **0.28GB**. That's
-structural, not something a runtime-venv-on-the-volume workaround (the
-previous version of this file) fixes — it only avoided re-installing
-dependencies per cold start, not the base image pull itself on a host
-that's never cached it.
+**Fifth architectural revision**: this was moved off `lmsysorg/sglang:dev`
+entirely, onto a genuinely custom, multi-stage Docker image built at
+BUILD time — real, registry-confirmed numbers that drove it:
+`lmsysorg/sglang:dev` is **13.80GB** compressed vs. koboldcpp's own base
+image at **0.28GB**. That shrunk the shipped image to **6.1GB**.
 
-So this `Dockerfile` is now a genuinely custom, multi-stage build:
-a `nvidia/cuda:*-cudnn-devel-*` builder stage (has the compiler, only to
-build SGLang's extensions — never shipped) installs SGLang + diffusion
-extras + the `runpod` SDK via `pip install --prefix=/install`, then a
-`nvidia/cuda:*-cudnn-runtime-*` final stage (no compiler, no devel
-headers) copies over just that installed tree. `serverless_handler.py`
-no longer does any runtime install at all — no venv, no cross-worker
-lock, no persistent-volume dependency for anything except the model
-weights themselves.
+**Seventh architectural revision, and a reversal of the Fifth**: shrinking
+the image never actually fixed the real problem. A real deploy of that
+6.1GB image showed one single 4.11GB layer taking **~11.5 minutes** to
+download on a fresh RunPod host (~6MB/s effective — vs. the ~250MB/s this
+same image pushed at when we built it). The reason: RunPod's Docker layer
+cache is **per physical host, not fleet-wide** — a worker landing on a
+host that's never pulled this image before pays the full cost again, no
+matter how small the image is. The persistent volume has the opposite
+property: it's the same volume wherever the worker lands, not tied to one
+host's local disk. So this repo is back to installing SGLang **at
+runtime, onto the volume**, once per volume — same principle as this
+file's own `HF_HOME` model-weight caching (and `handler.py`'s own
+`ensure_koboldcpp_engine()`/`VOLUME_DIR` pattern), just extended to
+SGLang itself. `Dockerfile` is back to a minimal, kobold-shaped image —
+just `python3`/`pip`/`git`/`ffmpeg` and `pip install runpod requests`,
+nothing SGLang-specific baked in at all.
 
-This was blocked on a real, verified risk before starting: `sgl_kernel`
-had a regression (`sgl-project/sglang#11333`) that hard-crashed on
-import if the CUDA **devel** toolkit wasn't present — which would have
-broken this exact "runtime-only final stage" approach. Confirmed fixed
-in `sgl-project/sglang#13089`, merged into `main` 2025-12-02 (the check
-is now a graceful fallback, not a crash). `serverless_handler.py` also
-sets `CUDA_HOME` to the pip-installed `nvidia-cuda-runtime` package's own
-directory at process start — the community-confirmed workaround from
-that same issue thread — belt-and-suspenders even with the fix merged.
+`ensure_sglang_installed()` in `serverless_handler.py` does the real
+work: creates a venv at `/runpod-volume/sglang_venv`, clones SGLang at
+the pinned commit, and `pip install`s the diffusion extras into it —
+guarded by a cross-worker lock (`mkdir`-based, atomic) with staleness
+detection from the start this time (a lock only cleaned up in a Python
+`finally` block never gets removed on a hard kill — this session already
+hit that exact deadlock once before and had to patch it in after the
+fact; this revision builds the fix in up front). `SGLANG_BUILD_RUST_EXTS=none`
+carries over from the old Dockerfile too: SGLang's pip build tries to
+discover and compile Rust extensions (disaggregated prefill/decode
+routing + gRPC infra for LLM *text* serving — never touched by the plain
+`sglang serve` diffusion path this handler uses) and needs a `cargo`
+toolchain this image doesn't have.
+
+This was blocked on a real, verified risk before ever trying a
+runtime-only approach: `sgl_kernel` had a regression
+(`sgl-project/sglang#11333`) that hard-crashed on import if the CUDA
+**devel** toolkit wasn't present. Confirmed fixed in
+`sgl-project/sglang#13089`, merged into `main` 2025-12-02 (the check is
+now a graceful fallback, not a crash). `serverless_handler.py` also sets
+`CUDA_HOME` to the venv's own `nvidia-cuda-runtime` package directory at
+process start — the community-confirmed workaround from that same issue
+thread — belt-and-suspenders even with the fix merged.
 
 Note: switching an existing endpoint from a Docker-image source to a
 GitHub-repo source isn't necessarily an in-place edit in RunPod's UI —
