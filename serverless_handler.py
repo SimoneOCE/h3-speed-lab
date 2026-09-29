@@ -156,6 +156,17 @@ def ensure_sglang_installed():
 
     if not got_lock:
         print("Another worker is already installing sglang onto this volume - waiting...", flush=True)
+        # BOTH wait loops below are bounded by STALE_LOCK_SECONDS - an
+        # earlier version of the second one had no timeout at all, which
+        # meant a worker that died mid-install (without ever writing
+        # INSTALL_MARKER or getting a chance to clean up its lock) would
+        # leave every future worker on this volume polling forever, never
+        # returning from handler() - burning GPU billing indefinitely with
+        # no way for RunPod to know the job was ever "done." Real risk,
+        # not hypothetical: this exact class of dead-lock already happened
+        # once earlier in this investigation, on the old runtime-venv
+        # architecture.
+        _wait_deadline = time.time() + STALE_LOCK_SECONDS
         while os.path.isdir(INSTALL_LOCK_DIR) and not os.path.exists(INSTALL_MARKER):
             try:
                 lock_age = time.time() - os.path.getmtime(INSTALL_LOCK_DIR)
@@ -164,6 +175,11 @@ def ensure_sglang_installed():
             if lock_age > STALE_LOCK_SECONDS:
                 print(f"Install lock is stale ({lock_age:.0f}s old) - assuming the worker that held it died. Self-healing.", flush=True)
                 break
+            if time.time() > _wait_deadline:
+                raise RuntimeError(
+                    f"Gave up waiting for another worker's sglang install after {STALE_LOCK_SECONDS}s "
+                    "(lock never went stale by its own mtime, but this wait has its own hard ceiling too)."
+                )
             time.sleep(3)
         if os.path.exists(INSTALL_MARKER):
             return
@@ -173,8 +189,14 @@ def ensure_sglang_installed():
         except FileExistsError:
             # Someone else grabbed it first, or a stale one just got
             # cleaned up by another worker at this exact instant - wait
-            # for the marker instead of racing further.
+            # for the marker instead of racing further, but bounded the
+            # same way, for the same reason.
+            _wait_deadline = time.time() + STALE_LOCK_SECONDS
             while not os.path.exists(INSTALL_MARKER):
+                if time.time() > _wait_deadline:
+                    raise RuntimeError(
+                        f"Gave up waiting for another worker's sglang install after {STALE_LOCK_SECONDS}s."
+                    )
                 time.sleep(3)
             return
 
@@ -182,14 +204,22 @@ def ensure_sglang_installed():
         print("Installing sglang onto the persistent volume (first worker on this volume)...", flush=True)
         install_start = time.time()
 
-        subprocess.run(["python3", "-m", "venv", SGLANG_VENV_DIR], check=True)
+        # Every subprocess.run below carries an explicit timeout=. None of
+        # them had one originally - if any single network call inside (git
+        # fetch, a pip download) genuinely hung rather than just being
+        # slow, subprocess.run would block forever with no way out,
+        # exactly like the lock-wait bug above. A hung install here would
+        # never raise, never let handler() return, and never send RunPod
+        # any signal that the job was done - pure wasted billing with no
+        # way to notice short of manually checking the dashboard.
+        subprocess.run(["python3", "-m", "venv", SGLANG_VENV_DIR], check=True, timeout=300)
 
         if os.path.exists(SGLANG_SRC_DIR):
             shutil.rmtree(SGLANG_SRC_DIR)
-        subprocess.run(["git", "init", SGLANG_SRC_DIR], check=True)
-        subprocess.run(["git", "remote", "add", "origin", "https://github.com/sgl-project/sglang.git"], check=True, cwd=SGLANG_SRC_DIR)
-        subprocess.run(["git", "fetch", "--depth", "1", "origin", SGLANG_COMMIT], check=True, cwd=SGLANG_SRC_DIR)
-        subprocess.run(["git", "checkout", "FETCH_HEAD"], check=True, cwd=SGLANG_SRC_DIR)
+        subprocess.run(["git", "init", SGLANG_SRC_DIR], check=True, timeout=60)
+        subprocess.run(["git", "remote", "add", "origin", "https://github.com/sgl-project/sglang.git"], check=True, cwd=SGLANG_SRC_DIR, timeout=60)
+        subprocess.run(["git", "fetch", "--depth", "1", "origin", SGLANG_COMMIT], check=True, cwd=SGLANG_SRC_DIR, timeout=600)
+        subprocess.run(["git", "checkout", "FETCH_HEAD"], check=True, cwd=SGLANG_SRC_DIR, timeout=120)
 
         env = os.environ.copy()
         # SGLang's pip build tries to discover and compile Rust extensions
@@ -204,10 +234,17 @@ def ensure_sglang_installed():
         # imported, never by the plain `sglang serve` diffusion path this
         # handler uses.
         env["SGLANG_BUILD_RUST_EXTS"] = "none"
+        # Generous on purpose - a real run of this exact install showed
+        # heavy pip dependency-resolver backtracking (flash-attn-4 alone
+        # tried 13 candidate versions) plus downloading PyTorch and its
+        # full CUDA dependency tree. Bounded, not unbounded, is what
+        # matters here - 3600s is the same order of magnitude as this
+        # file's own COLD_START_MAX_WAIT_SECONDS for model loading, not a
+        # number expected to actually bind in the normal case.
         subprocess.run(
             [SGLANG_VENV_PYTHON, "-m", "pip", "install",
              f"{SGLANG_SRC_DIR}/python[diffusion]", "runpod", "requests"],
-            env=env, check=True,
+            env=env, check=True, timeout=3600,
         )
 
         elapsed = round(time.time() - install_start, 1)
